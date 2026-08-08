@@ -8,7 +8,9 @@ No API keys, no subscriptions, no background service. Run manually:
 
     python3 daily_digest.py
 
-Generates an HTML file in ./digests/ and opens it in your browser.
+Generates the full ranked archive in ./digests/, a curated top-N front
+page at ./docs/index.html (served by GitHub Pages), and opens the local
+archive in your browser.
 """
 
 import html
@@ -55,6 +57,26 @@ def truncate(text, max_chars):
         return text
     cut = text[:max_chars].rsplit(" ", 1)[0]
     return cut.rstrip(".,;: ") + "…"
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def build_dek(text, max_chars):
+    """Take whole sentences up to max_chars, instead of an arbitrary cut."""
+    text = text.strip()
+    if not text:
+        return ""
+    sentences = _SENTENCE_SPLIT_RE.split(text)
+    dek = ""
+    for sentence in sentences:
+        candidate = f"{dek} {sentence}".strip() if dek else sentence
+        if len(candidate) > max_chars and dek:
+            break
+        dek = candidate
+        if len(dek) > max_chars:
+            break
+    return truncate(dek, max_chars)
 
 
 def parse_rss_date(raw):
@@ -115,7 +137,7 @@ def parse_rss(xml_bytes, limit):
                     break
 
         summary_raw = find_text("description", "summary", "content")
-        summary = truncate(strip_html(summary_raw), config.SUMMARY_MAX_CHARS)
+        summary = build_dek(strip_html(summary_raw), config.SUMMARY_MAX_CHARS)
 
         date_raw = find_text("pubdate", "published", "updated", "date")
         date = parse_rss_date(date_raw)
@@ -176,6 +198,39 @@ def collect_auto_sources():
     return results
 
 
+_PUBMED_DATE_FORMATS = ("%Y %b %d", "%Y %b", "%Y")
+
+
+def parse_pubmed_date(raw):
+    if not raw:
+        return None
+    # esummary pubdate strings look like "2026 Aug 5", "2026 Aug", or "2026".
+    cleaned = raw.split("-")[0].strip()
+    for fmt in _PUBMED_DATE_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def fetch_pubmed_abstracts(ids, base):
+    params = urllib.parse.urlencode(
+        {"db": "pubmed", "id": ",".join(ids), "rettype": "abstract", "retmode": "xml"}
+    )
+    raw = fetch_url(base + "efetch.fcgi?" + params)
+    root = ET.fromstring(raw)
+    abstracts = {}
+    for article in root.iter("PubmedArticle"):
+        pmid_el = article.find(".//PMID")
+        if pmid_el is None or not pmid_el.text:
+            continue
+        pieces = [el.text or "" for el in article.iter("AbstractText")]
+        if pieces:
+            abstracts[pmid_el.text] = " ".join(pieces)
+    return abstracts
+
+
 def fetch_pubmed(category, query, limit):
     print(f"Fetching PubMed: {category}...")
     base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
@@ -200,6 +255,12 @@ def fetch_pubmed(category, query, limit):
         )
         summary_raw = fetch_url(base + "esummary.fcgi?" + summary_params)
         summary_json = json.loads(summary_raw)
+
+        try:
+            abstracts = fetch_pubmed_abstracts(ids, base)
+        except (urllib.error.URLError, ET.ParseError, TimeoutError):
+            abstracts = {}
+
         results = []
         for pmid in ids:
             record = summary_json.get("result", {}).get(pmid)
@@ -208,13 +269,19 @@ def fetch_pubmed(category, query, limit):
             title = strip_html(record.get("title", ""))
             journal = record.get("fulljournalname", "PubMed")
             pubdate = record.get("pubdate", "")
+            abstract = strip_html(abstracts.get(pmid, ""))
+            dek = (
+                build_dek(abstract, config.SUMMARY_MAX_CHARS)
+                if abstract
+                else f"New research published in {journal}."
+            )
             results.append(
                 {
                     "title": title,
                     "link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                    "summary": f"{journal} — {pubdate}",
-                    "date": None,
-                    "source": "PubMed",
+                    "summary": dek,
+                    "date": parse_pubmed_date(pubdate),
+                    "source": journal,
                     "category": category,
                 }
             )
@@ -244,59 +311,107 @@ def dedupe(items):
     return unique
 
 
-def group_by_category(items):
-    grouped = {c: [] for c in config.CATEGORIES}
+def score_item(item, now):
+    text = f"{item['title']} {item['summary']}".lower()
+
+    topic_hits = sum(
+        1
+        for keywords in config.CATEGORY_KEYWORDS.values()
+        for kw in keywords
+        if kw in text
+    )
+    egypt_hits = sum(1 for kw in config.EGYPT_ME_KEYWORDS if kw in text)
+    egypt_source_bonus = (
+        config.EGYPT_ME_SOURCE_BONUS if item["source"] in config.EGYPT_ME_SOURCES else 0
+    )
+
+    if item["date"]:
+        age_days = max(0.0, (now - item["date"]).total_seconds() / 86400)
+    else:
+        age_days = config.RECENCY_HALF_LIFE_DAYS  # neutral default when no date is known
+    recency_score = config.RECENCY_WEIGHT * (0.5 ** (age_days / config.RECENCY_HALF_LIFE_DAYS))
+
+    return (
+        topic_hits * config.TOPIC_KEYWORD_WEIGHT
+        + egypt_hits * config.EGYPT_ME_KEYWORD_WEIGHT
+        + egypt_source_bonus
+        + recency_score
+    )
+
+
+def rank_items(items, now):
     for item in items:
-        grouped.setdefault(item["category"], []).append(item)
-    for category, group in grouped.items():
-        group.sort(key=lambda i: i["date"] or datetime.min.replace(tzinfo=None), reverse=True)
-    return grouped
+        item["score"] = score_item(item, now)
+    return sorted(items, key=lambda i: i["score"], reverse=True)
 
 
-def render_html(grouped, generated_at):
+def issue_number(today):
+    epoch = datetime.strptime(config.ISSUE_EPOCH, "%Y-%m-%d").date()
+    return max(1, (today - epoch).days + 1)
+
+
+def render_html(ranked_items, generated_at):
+    issue = issue_number(generated_at.date())
     parts = [
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-        f"<title>Daily Digest — {generated_at:%B %d, %Y}</title>",
+        f"<title>{html.escape(config.MASTHEAD_TITLE)} — {generated_at:%B %d, %Y}</title>",
+        "<link rel='preconnect' href='https://fonts.googleapis.com'>",
+        "<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>",
+        "<link href='https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&display=swap' rel='stylesheet'>",
         "<style>",
         """
         body { font-family: -apple-system, Helvetica, Arial, sans-serif;
-               max-width: 720px; margin: 0 auto; padding: 24px 16px 64px;
-               background: #fafaf8; color: #1f2430; }
-        h1 { font-size: 1.5rem; margin-bottom: 0; }
-        .subtitle { color: #6b7280; margin-top: 4px; margin-bottom: 32px; font-size: 0.9rem; }
-        h2 { font-size: 1.05rem; text-transform: uppercase; letter-spacing: 0.04em;
-             color: #4a5568; border-bottom: 2px solid #e2e8f0; padding-bottom: 6px;
-             margin-top: 40px; }
-        .item { padding: 14px 0; border-bottom: 1px solid #edf0f3; }
-        .item:last-child { border-bottom: none; }
-        .item a { font-size: 1.02rem; font-weight: 600; color: #1a56db;
-                  text-decoration: none; }
-        .item a:hover { text-decoration: underline; }
-        .item .summary { margin: 4px 0 0; color: #374151; font-size: 0.92rem; }
-        .item .meta { margin-top: 4px; color: #9ca3af; font-size: 0.78rem; }
-        .empty { color: #9ca3af; font-style: italic; padding: 10px 0; }
+               max-width: 760px; margin: 0 auto; padding: 32px 20px 80px;
+               background: #fff; color: #171717; }
+        .masthead { text-align: center; }
+        .masthead h1 { font-family: 'Playfair Display', Georgia, serif;
+               font-weight: 900; font-size: 2.75rem; margin: 0; }
+        .masthead .tagline { color: #555; font-size: 0.95rem; margin: 8px 0 0; }
+        .rule-thick { border: none; border-top: 3px solid #171717; margin: 20px 0 6px; }
+        .meta-line { display: flex; justify-content: space-between; color: #666;
+               font-size: 0.82rem; padding-bottom: 10px; border-bottom: 1px solid #ccc;
+               margin-bottom: 30px; }
+        .label { text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.78rem;
+               font-weight: 700; color: #1a56db; margin: 0 0 8px; }
+        .story { padding: 24px 0; border-bottom: 1px solid #e6e6e6; }
+        .story:last-child { border-bottom: none; }
+        .story h2 { font-family: 'Playfair Display', Georgia, serif; font-weight: 700;
+               font-size: 1.4rem; line-height: 1.28; margin: 0 0 10px; }
+        .story.lead h2 { font-size: 2rem; }
+        .story h2 a { color: #171717; text-decoration: none; }
+        .story h2 a:hover { text-decoration: underline; }
+        .story .dek { font-size: 1rem; color: #222; margin: 0 0 8px; line-height: 1.55; }
+        .story .source { font-size: 0.8rem; color: #888; }
+        .empty { color: #999; font-style: italic; padding: 20px 0; }
         """,
         "</style></head><body>",
-        "<h1>Your Daily Digest</h1>",
-        f"<p class='subtitle'>Generated {generated_at:%A, %B %d, %Y at %I:%M %p}</p>",
+        "<div class='masthead'>",
+        f"<h1>{html.escape(config.MASTHEAD_TITLE)}</h1>",
+        f"<p class='tagline'>{html.escape(config.MASTHEAD_TAGLINE)}</p>",
+        "</div>",
+        "<hr class='rule-thick'>",
+        "<div class='meta-line'>"
+        f"<span>{generated_at:%A, %B %d, %Y}</span>"
+        f"<span>Issue no. {issue}</span>"
+        "</div>",
     ]
 
-    for category in config.CATEGORIES:
-        items = grouped.get(category, [])
-        parts.append(f"<h2>{html.escape(category)}</h2>")
-        if not items:
-            parts.append("<p class='empty'>No fresh items today.</p>")
-            continue
-        for item in items:
+    if not ranked_items:
+        parts.append("<p class='empty'>No fresh items today — check back tomorrow.</p>")
+    else:
+        for i, item in enumerate(ranked_items):
+            is_lead = i == 0
             date_str = item["date"].strftime("%b %d, %Y") if item["date"] else ""
-            meta = f"{html.escape(item['source'])}" + (f" · {date_str}" if date_str else "")
+            source_line = html.escape(item["source"]) + (f" · {date_str}" if date_str else "")
+            parts.append(f"<div class='story{' lead' if is_lead else ''}'>")
+            if is_lead:
+                parts.append("<p class='label'>Lead story</p>")
             parts.append(
-                "<div class='item'>"
-                f"<a href='{html.escape(item['link'])}' target='_blank' rel='noopener'>"
-                f"{html.escape(item['title'])}</a>"
-                f"<p class='summary'>{html.escape(item['summary'])}</p>"
-                f"<p class='meta'>{meta}</p>"
+                f"<h2><a href='{html.escape(item['link'])}' target='_blank' rel='noopener'>"
+                f"{html.escape(item['title'])}</a></h2>"
+                f"<p class='dek'>{html.escape(item['summary'])}</p>"
+                f"<p class='source'>{source_line}</p>"
                 "</div>"
             )
 
@@ -311,21 +426,23 @@ def main():
     all_items.extend(collect_pubmed())
     all_items = dedupe(all_items)
 
-    grouped = group_by_category(all_items)
-
     generated_at = datetime.now()
-    output_html = render_html(grouped, generated_at)
+    ranked_items = rank_items(all_items, generated_at)
 
+    # Full ranked list, saved locally for your own reference/archive.
     OUTPUT_DIR.mkdir(exist_ok=True)
     out_path = OUTPUT_DIR / f"digest-{generated_at:%Y-%m-%d}.html"
-    out_path.write_text(output_html, encoding="utf-8")
+    out_path.write_text(render_html(ranked_items, generated_at), encoding="utf-8")
 
+    # Curated front page: only the top N stories by relevance score.
+    front_page_items = ranked_items[: config.MAX_FRONT_PAGE_ITEMS]
     SITE_INDEX_PATH.parent.mkdir(exist_ok=True)
-    SITE_INDEX_PATH.write_text(output_html, encoding="utf-8")
+    SITE_INDEX_PATH.write_text(
+        render_html(front_page_items, generated_at), encoding="utf-8"
+    )
 
-    total = sum(len(v) for v in grouped.values())
-    print(f"\nSaved {total} items to {out_path}")
-    print(f"Updated site page at {SITE_INDEX_PATH}")
+    print(f"\nSaved {len(ranked_items)} items to {out_path}")
+    print(f"Updated site page ({len(front_page_items)} items) at {SITE_INDEX_PATH}")
 
     if not IS_CI:
         webbrowser.open(f"file://{out_path.resolve()}")

@@ -116,4 +116,36 @@ PUBMED_QUERIES = {
 
 MAX_ITEMS_PER_RSS_SOURCE = 5
 MAX_ITEMS_PER_PUBMED_QUERY = 4
-SUMMARY_MAX_CHARS = 160
+SUMMARY_MAX_CHARS = 220
+
+# --- Front page (docs/index.html) presentation ---
+
+MASTHEAD_TITLE = "The Behavioral Brief"
+MASTHEAD_TAGLINE = "Adolescent psychology · behavioral therapy · education · Egypt & global"
+
+# The front page shows only the top N items by relevance score (the full,
+# unranked list for every item found still gets saved locally under digests/).
+MAX_FRONT_PAGE_ITEMS = 10
+
+# Issue number is computed from days elapsed since this date -- no counter
+# file to maintain, just deterministic based on today's date.
+ISSUE_EPOCH = "2026-08-08"
+
+# Words/phrases that mark an item as Egypt/Middle East relevant, for ranking
+# purposes (extra weight) regardless of which source it came from.
+EGYPT_ME_KEYWORDS = [
+    "egypt", "cairo", "arab", "middle east", "mena", "gulf", "saudi",
+    "jordan", "lebanon", "uae", "emirates", "qatar", "kuwait", "bahrain",
+    "oman", "palestin", "jerusalem", "syria", "iraq",
+]
+
+# Sources that are inherently Egypt/Middle East focused get this flat bonus
+# added on top of any keyword matches above.
+EGYPT_ME_SOURCES = {"Egypt Independent", "Daily News Egypt", "Arab News"}
+
+# Relative weights used when scoring items for the front page ranking.
+TOPIC_KEYWORD_WEIGHT = 2
+EGYPT_ME_KEYWORD_WEIGHT = 3
+EGYPT_ME_SOURCE_BONUS = 4
+RECENCY_WEIGHT = 5
+RECENCY_HALF_LIFE_DAYS = 3
